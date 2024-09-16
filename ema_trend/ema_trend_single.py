@@ -3,15 +3,25 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import random
+
+# Step 1: Get the list of S&P 500 stocks
+def get_sp500_tickers():
+    table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+    df = table[0]
+    return df['Symbol'].tolist()
+
+tickers = get_sp500_tickers()
+tickers = random.sample(tickers, 100)
 
 # Parameters
-ticker = 'PLTR'  # Change this to any ticker you want
+ticker = 'TQQQ'  # Change this to any ticker you want
 start_date = '2020-01-01'
 end_date = '2024-09-13'
 
 # Strategy Parameters
 starting_capital = 100000  # Starting capital in dollars
-leverage = 2  # Leverage factor
+leverage = 3  # Leverage factor
 
 # Fetch historical data
 data = yf.download(ticker, start=start_date, end=end_date, progress=False)
