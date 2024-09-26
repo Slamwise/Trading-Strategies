@@ -1,5 +1,6 @@
 FinFutYY.txt
 data/
+*.pkl
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
