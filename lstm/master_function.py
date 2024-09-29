@@ -42,6 +42,64 @@ def data_preprocessing(data, num_lags, train_test_split):
 
     return x_train, y_train, x_test, y_test
 
+def data_preprocessing_multi(data, target, num_lags, target_lag, train_test_split):
+    """
+    Preprocess data for multi-dimensional input and future lag prediction.
+
+    Parameters:
+    - data: numpy array of shape (num_samples, num_features)
+    - target: numpy array of shape (num_samples,), the target variable to predict
+    - num_lags: int, number of past time steps to use as input
+    - target_lag: int, number of time steps ahead to predict
+    - train_test_split: float, fraction of data to use for training
+
+    Returns:
+    - x_train, y_train, x_test, y_test: arrays for model training and testing
+    - x_scaler, y_scaler: fitted scalers for input and target data
+    """
+    from sklearn.preprocessing import StandardScaler
+    import pickle
+
+    x, y = [], []
+    total_samples = len(data)
+    for i in range(total_samples - num_lags - target_lag + 1):
+        x.append(data[i:i + num_lags])
+        y.append(target[i + num_lags + target_lag - 1])
+
+    x = np.array(x)  # Shape: (num_samples, num_lags, num_features)
+    y = np.array(y)  # Shape: (num_samples,)
+
+    # Split the data
+    split_index = int(train_test_split * len(x))
+    x_train, y_train = x[:split_index], y[:split_index]
+    x_test, y_test = x[split_index:], y[split_index:]
+
+    # Initialize and fit scalers on training data
+    x_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+
+    # Reshape x_train for scaling
+    x_train_reshaped = x_train.reshape(-1, x_train.shape[-1])
+    x_scaler.fit(x_train_reshaped)
+
+    # Scale x_train and x_test
+    x_train_scaled = x_scaler.transform(x_train_reshaped).reshape(x_train.shape)
+    x_test_scaled = x_scaler.transform(x_test.reshape(-1, x_test.shape[-1])).reshape(x_test.shape)
+
+    # Scale y_train and y_test
+    y_scaler.fit(y_train.reshape(-1, 1))
+    y_train_scaled = y_scaler.transform(y_train.reshape(-1, 1)).flatten()
+    y_test_scaled = y_scaler.transform(y_test.reshape(-1, 1)).flatten()
+
+    # Save scalers as pickles
+    with open('x_scaler.pkl', 'wb') as f:
+        pickle.dump(x_scaler, f)
+    with open('y_scaler.pkl', 'wb') as f:
+        pickle.dump(y_scaler, f)
+
+    return x_train_scaled, y_train_scaled, x_test_scaled, y_test_scaled
+
+
 def recursive_mpf(x_test, y_test, num_lags, model, architecture = 'MLP'):
     if architecture == 'MLP':
         # Latest values to use as inputs
@@ -116,25 +174,31 @@ def import_cot_data(start_year, end_year, market):
     
     return data
 
-def plot_train_test_values(window, train_window, y_train, y_test, y_predicted):
+def plot_train_test_values(window, train_window, target_lag, y_train, y_test, y_predicted):
     prediction_window = window
     first = train_window
     second = window - first
     y_predicted = np.reshape(y_predicted, (-1, 1))
     y_test = np.reshape(y_test, (-1, 1))
-    plotting_time_series = np.zeros((prediction_window, 3))
+    
+    # Adjust the plotting array to account for the target lag
+    plotting_time_series = np.zeros((prediction_window + target_lag, 3))
     plotting_time_series[0:first, 0] = y_train[-first:]
-    plotting_time_series[first:, 1] = y_test[0:second, 0]
-    plotting_time_series[first:, 2] = y_predicted[0:second, 0] 
-    plotting_time_series[0:first, 1] = plotting_time_series[0:first, 1] / 0
-    plotting_time_series[0:first, 2] = plotting_time_series[0:first, 2] / 0
-    plotting_time_series[first:, 0] = plotting_time_series[first:, 0] / 0
-    plt.plot(plotting_time_series[:, 0], label = 'Training data', color = 'black', linewidth = 2.5)
-    plt.plot(plotting_time_series[:, 1], label = 'Test data', color = 'black', linestyle = 'dashed', linewidth = 2)
-    plt.plot(plotting_time_series[:, 2], label = 'Predicted data', color = 'red', linewidth = 1)
-    plt.axvline(x = first, color = 'black', linestyle = '--', linewidth = 1)
+    plotting_time_series[first + target_lag:, 1] = y_test[0:second - target_lag + 1, 0]
+    plotting_time_series[first + target_lag:, 2] = y_predicted[0:second - target_lag + 1, 0]
+    
+    # Set initial values to NaN where data isn't available
+    plotting_time_series[0:first + target_lag, 1:] = np.nan
+    plotting_time_series[first + target_lag:, 0] = np.nan
+    
+    plt.plot(plotting_time_series[:, 0], label='Training data', color='black', linewidth=2.5)
+    plt.plot(plotting_time_series[:, 1], label='Test data', color='black', linestyle='dashed', linewidth=2)
+    plt.plot(plotting_time_series[:, 2], label='Predicted data', color='red', linewidth=1)
+    plt.axvline(x=first, color='black', linestyle='--', linewidth=1)
     plt.grid()
     plt.legend()
+    plt.show()
+
 
 def forecasting_threshold(predictions, threshold):
     for i in range(len(predictions)):
