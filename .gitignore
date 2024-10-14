@@ -1,6 +1,7 @@
 FinFutYY.txt
 data/
 *.pkl
+.ruff_cache
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
