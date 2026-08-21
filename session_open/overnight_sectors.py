@@ -55,6 +55,7 @@ SECTORS = {
     'Robotics': ['ISRG', 'ROK', 'TER', 'SYM', 'PATH', 'SERV'],
     'Metals': ['FCX', 'NEM', 'AA', 'CLF', 'MP', 'SCCO'],
     'Energy': ['XOM', 'CVX', 'COP', 'SLB', 'OXY', 'DVN'],
+    'Healthcare': ['LLY', 'UNH', 'JNJ', 'PFE', 'MRK', 'MRNA'],
 }
 
 
