@@ -14,15 +14,25 @@ Prices are split and dividend adjusted, so a split does not show up as a fake
 overnight gap and a dividend is credited to the holder the way it would be in a
 real account.
 
-Each night the same fixed notional is deployed (see CAPITAL below), so the P&L
-curves are additive and directly comparable across names. Compounded returns
-are reported in the metrics table as well.
+Two presentation choices matter more than anything else here, because the
+overnight effect is a compounding story:
+
+  * The window runs over each name's full available history by default. MU has
+    bars back to 1984, and starting in, say, 2015 throws away thirty years of
+    compounding and badly understates the effect.
+  * The headline chart compounds. Overnight returns carry roughly half the
+    volatility of the full close-to-close move at a similar average return, so
+    the gap between them only opens up once returns are reinvested. A fixed
+    notional chart is also produced, but by construction it makes buy and hold
+    look best whenever the intraday leg is positive, because the two legs
+    simply add up.
 
 Two things worth remembering before reading anything into the results: filling
 at the official close and the official open needs market-on-close and
 market-on-open orders, and roughly 250 round trips a year makes the strategy
-very sensitive to costs. The cost sensitivity table at the bottom of the run
-shows how quickly the edge decays.
+very sensitive to costs. The run prints the cost per side at which the
+overnight strategy stops beating buy and hold, which is the number that decides
+whether any of this survives contact with a broker.
 """
 
 import os
@@ -35,10 +45,11 @@ import yfinance as yf
 
 # Parameters
 TICKERS = ['MU', 'NVDA', 'AMD', 'TSLA', 'MRVL', 'ON', 'SMCI', 'COIN']
+FOCUS_TICKER = 'MU'        # the name broken out in the session decomposition chart
 BENCHMARK = 'SPY'          # used for the realized beta column
-START_DATE = '2015-01-01'
+START_DATE = None          # None = each name's full available history
 END_DATE = None            # None = up to the latest available bar
-CAPITAL = 100_000          # notional deployed each night, per name
+CAPITAL = 100_000          # stake per name: compounded, and deployed per night
 COST_BPS_PER_SIDE = 0.0    # commission + slippage per side, in basis points
 CHART_DIR = 'overnight_charts'
 TRADING_DAYS = 252
@@ -54,7 +65,7 @@ SERIES_COLORS = [
     '#4a3aa7',  # violet
     '#e34948',  # red
 ]
-INK = '#0b0b0b'         # primary text, also the portfolio line
+INK = '#0b0b0b'         # primary text, also the basket line
 INK_MUTED = '#52514e'   # axis and secondary text
 SURFACE = '#fcfcfb'
 GRID = '#e8e7e3'
@@ -78,16 +89,20 @@ def make_session():
 
 def download_prices(tickers, start_date, end_date):
     """Download adjusted daily bars and return {ticker: DataFrame}."""
-    raw = yf.download(
-        tickers,
-        start=start_date,
-        end=end_date,
+    request = dict(
         progress=False,
         auto_adjust=True,
         group_by='ticker',
         threads=False,
         session=make_session(),
     )
+    if start_date is None and end_date is None:
+        request['period'] = 'max'
+    else:
+        request['start'] = start_date
+        request['end'] = end_date
+
+    raw = yf.download(tickers, **request)
 
     prices = {}
     for ticker in tickers:
@@ -134,14 +149,26 @@ def apply_costs(returns, cost_bps_per_side):
     return returns - 2 * cost_bps_per_side / 10_000
 
 
+def compounded_equity(returns, capital=CAPITAL):
+    """Equity curve if the whole stake is reinvested every night."""
+    return capital * (1 + returns.fillna(0)).cumprod()
+
+
 def cumulative_pnl(returns, capital=CAPITAL):
     """Cumulative dollar P&L from deploying a fixed notional every night."""
     return (returns.fillna(0) * capital).cumsum()
 
 
-def compounded_equity(returns, capital=CAPITAL):
-    """Equity curve if the whole book is reinvested every night."""
-    return capital * (1 + returns.fillna(0)).cumprod()
+def total_return(returns):
+    return (1 + returns.fillna(0)).prod() - 1
+
+
+def annualized(returns):
+    """CAGR of the compounded curve, from the calendar span of the returns."""
+    years = (returns.index[-1] - returns.index[0]).days / 365.25
+    if years <= 0:
+        return np.nan
+    return (1 + total_return(returns)) ** (1 / years) - 1
 
 
 def max_drawdown(equity):
@@ -165,62 +192,67 @@ def realized_beta(returns, benchmark_returns):
     return asset.cov(market) / market_var
 
 
+def breakeven_cost_vs_buy_hold(overnight, buy_hold):
+    """Highest cost per side at which overnight still beats buy and hold.
+
+    Searched on a 0.1 bp grid. Returns 0.0 if the strategy never wins and the
+    top of the grid if costs never bite hard enough to matter.
+    """
+    target = total_return(buy_hold)
+    best = 0.0
+    for cost in np.arange(0.0, 20.01, 0.1):
+        if total_return(apply_costs(overnight, cost)) > target:
+            best = cost
+        else:
+            break
+    return best
+
+
 def compute_metrics(name, frame, benchmark_returns, cost_bps_per_side):
     """Summary statistics for one name's overnight strategy."""
     overnight = apply_costs(frame['Overnight'], cost_bps_per_side)
     equity = compounded_equity(overnight)
-    pnl = cumulative_pnl(overnight)
-
-    years = (frame.index[-1] - frame.index[0]).days / 365.25
-    total_return = equity.iloc[-1] / CAPITAL - 1
-    cagr = (equity.iloc[-1] / CAPITAL) ** (1 / years) - 1 if years > 0 else np.nan
     std = overnight.std()
-    sharpe = overnight.mean() / std * np.sqrt(TRADING_DAYS) if std > 0 else np.nan
 
     return {
         'Ticker': name,
         'Start': frame.index[0].date(),
-        'End': frame.index[-1].date(),
         'Nights': len(overnight),
         'Beta vs ' + BENCHMARK: realized_beta(frame['BuyHold'], benchmark_returns),
-        'Total P&L': pnl.iloc[-1],
-        'Compounded Return': total_return,
-        'CAGR': cagr,
-        'Sharpe': sharpe,
+        'Overnight Return': total_return(overnight),
+        'Overnight CAGR': annualized(overnight),
+        'Overnight Vol': std * np.sqrt(TRADING_DAYS),
+        'Intraday Return': total_return(frame['Intraday']),
+        'Buy & Hold Return': total_return(frame['BuyHold']),
+        'Buy & Hold CAGR': annualized(frame['BuyHold']),
+        'Buy & Hold Vol': frame['BuyHold'].std() * np.sqrt(TRADING_DAYS),
+        'Sharpe': overnight.mean() / std * np.sqrt(TRADING_DAYS) if std > 0 else np.nan,
         'Max Drawdown': max_drawdown(equity),
         'Win Rate': (overnight > 0).mean(),
         'Avg bps/Night': overnight.mean() * 10_000,
-        'Best Night': overnight.max(),
-        'Worst Night': overnight.min(),
-        'Intraday Return': (1 + frame['Intraday'].fillna(0)).prod() - 1,
-        'Buy & Hold Return': (1 + frame['BuyHold'].fillna(0)).prod() - 1,
+        'Breakeven bps/side': breakeven_cost_vs_buy_hold(frame['Overnight'], frame['BuyHold']),
+        'Fixed-Notional P&L': cumulative_pnl(overnight).iloc[-1],
     }
 
 
-def build_portfolio(returns_by_ticker):
+def build_basket(returns_by_ticker):
     """Equal weight the available names each night, rebalanced daily.
 
-    Names with a later listing date simply join the average once they have
-    data, so the early part of the curve is the basket that actually existed.
+    Names with a later listing date join the average once they have data, so
+    the early part of the curve is the basket that actually existed. Over full
+    history that means the basket starts as one or two names and widens.
     """
-    matrix = pd.DataFrame({t: f['Overnight'] for t, f in returns_by_ticker.items()})
-    intraday = pd.DataFrame({t: f['Intraday'] for t, f in returns_by_ticker.items()})
-    buy_hold = pd.DataFrame({t: f['BuyHold'] for t, f in returns_by_ticker.items()})
-
+    frames = {
+        column: pd.DataFrame({t: f[column] for t, f in returns_by_ticker.items()})
+        for column in ['Overnight', 'Intraday', 'BuyHold']
+    }
     return pd.DataFrame({
-        'Overnight': matrix.mean(axis=1, skipna=True),
-        'Intraday': intraday.mean(axis=1, skipna=True),
-        'BuyHold': buy_hold.mean(axis=1, skipna=True),
+        column: frame.mean(axis=1, skipna=True) for column, frame in frames.items()
     }).dropna(how='all')
 
 
-def style_layout(fig, title, subtitle, yaxis_title, x_range=None):
-    """Shared chart chrome: recessive grid, one axis, legend below the plot.
-
-    The legend sits under the x axis so it never crowds the subtitle, and the x
-    range is pinned to the data so a right hand direct label does not stretch
-    the axis into empty years.
-    """
+def style_layout(fig, title, subtitle, yaxis_title, x_range=None, log=False):
+    """Shared chart chrome: recessive grid, one axis, legend below the plot."""
     fig.update_layout(
         title=dict(
             text=f"{title}<br><span style='font-size:13px;color:{INK_MUTED}'>{subtitle}</span>",
@@ -243,21 +275,85 @@ def style_layout(fig, title, subtitle, yaxis_title, x_range=None):
             x=0.5,
             title=None,
         ),
-        margin=dict(l=80, r=150, t=90, b=80),
+        margin=dict(l=90, r=150, t=90, b=80),
     )
     fig.update_xaxes(showgrid=False, linecolor=GRID, ticks='outside', tickcolor=GRID)
-    fig.update_yaxes(gridcolor=GRID, zeroline=False, linecolor=GRID, tickprefix='$', tickformat=',.0f')
-    fig.add_hline(y=0, line_width=1, line_color=GRID)
+    fig.update_yaxes(gridcolor=GRID, zeroline=False, linecolor=GRID,
+                     tickprefix='$', tickformat=',.0f')
+    if log:
+        # Equity spans several orders of magnitude over a multi-decade run, so a
+        # linear axis would flatten everything before the last few years.
+        fig.update_yaxes(type='log', dtick=1)
+    else:
+        fig.add_hline(y=0, line_width=1, line_color=GRID)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     return fig
 
 
-def create_pnl_chart(pnl_by_ticker, portfolio_pnl, cost_bps_per_side):
-    """The headline chart: cumulative P&L over time, one line per name."""
+def add_end_label(fig, series, text, color):
+    """Direct label at the right end of a line, drawn into the right margin."""
+    fig.add_annotation(
+        x=series.index[-1],
+        y=np.log10(series.iloc[-1]) if fig.layout.yaxis.type == 'log' else series.iloc[-1],
+        text=f"  {text}",
+        showarrow=False,
+        xanchor='left',
+        font=dict(color=color, size=12),
+    )
+
+
+def create_growth_chart(returns_by_ticker, basket, cost_bps_per_side):
+    """The headline chart: compounded growth of the stake, log scale."""
     fig = go.Figure()
 
-    for i, (ticker, pnl) in enumerate(pnl_by_ticker.items()):
+    for i, (ticker, frame) in enumerate(returns_by_ticker.items()):
+        equity = compounded_equity(apply_costs(frame['Overnight'], cost_bps_per_side))
+        fig.add_trace(go.Scatter(
+            x=equity.index,
+            y=equity.values,
+            mode='lines',
+            name=ticker,
+            line=dict(color=SERIES_COLORS[i % len(SERIES_COLORS)], width=2),
+            hovertemplate='%{fullData.name}: $%{y:,.0f}<extra></extra>',
+        ))
+
+    basket_equity = compounded_equity(apply_costs(basket['Overnight'], cost_bps_per_side))
+    fig.add_trace(go.Scatter(
+        x=basket_equity.index,
+        y=basket_equity.values,
+        mode='lines',
+        name='Equal weight basket',
+        line=dict(color=INK, width=3),
+        hovertemplate='%{fullData.name}: $%{y:,.0f}<extra></extra>',
+    ))
+
+    cost_note = (
+        'gross of costs' if not cost_bps_per_side
+        else f'net of {cost_bps_per_side:g} bps per side'
+    )
+    style_layout(
+        fig,
+        'Buy the close, sell the open',
+        f'Growth of ${CAPITAL:,.0f} reinvested every night, log scale, {cost_note}',
+        f'Value of ${CAPITAL:,.0f} stake',
+        x_range=(basket_equity.index[0], basket_equity.index[-1]),
+        log=True,
+    )
+    add_end_label(fig, basket_equity, 'Equal weight basket', INK)
+    return fig
+
+
+def create_pnl_chart(returns_by_ticker, basket, cost_bps_per_side):
+    """Cumulative P&L from a fixed stake each night, without reinvestment.
+
+    This answers 'what did an average night pay' rather than 'what would the
+    account be worth', so the vertical scale stays in plain dollars.
+    """
+    fig = go.Figure()
+
+    for i, (ticker, frame) in enumerate(returns_by_ticker.items()):
+        pnl = cumulative_pnl(apply_costs(frame['Overnight'], cost_bps_per_side))
         fig.add_trace(go.Scatter(
             x=pnl.index,
             y=pnl.values,
@@ -267,94 +363,91 @@ def create_pnl_chart(pnl_by_ticker, portfolio_pnl, cost_bps_per_side):
             hovertemplate='%{fullData.name}: $%{y:,.0f}<extra></extra>',
         ))
 
+    basket_pnl = cumulative_pnl(apply_costs(basket['Overnight'], cost_bps_per_side))
     fig.add_trace(go.Scatter(
-        x=portfolio_pnl.index,
-        y=portfolio_pnl.values,
+        x=basket_pnl.index,
+        y=basket_pnl.values,
         mode='lines',
         name='Equal weight basket',
         line=dict(color=INK, width=3),
         hovertemplate='%{fullData.name}: $%{y:,.0f}<extra></extra>',
     ))
 
-    # Direct label on the emphasis series so it reads without the legend.
-    fig.add_annotation(
-        x=portfolio_pnl.index[-1],
-        y=portfolio_pnl.iloc[-1],
-        text='  Equal weight basket',
-        showarrow=False,
-        xanchor='left',
-        font=dict(color=INK, size=12),
-    )
-
-    cost_note = (
-        'gross of costs' if not cost_bps_per_side
-        else f'net of {cost_bps_per_side:g} bps per side'
-    )
     style_layout(
         fig,
-        'Buy the close, sell the open',
-        f'Cumulative P&amp;L on ${CAPITAL:,.0f} deployed every night, {cost_note}',
+        'Buy the close, sell the open, no reinvestment',
+        f'Cumulative P&amp;L on a flat ${CAPITAL:,.0f} deployed every night',
         'Cumulative P&L',
-        x_range=(portfolio_pnl.index[0], portfolio_pnl.index[-1]),
+        x_range=(basket_pnl.index[0], basket_pnl.index[-1]),
     )
+    add_end_label(fig, basket_pnl, 'Equal weight basket', INK)
     return fig
 
 
-def create_session_chart(portfolio, cost_bps_per_side):
+def create_session_chart(frame, label, cost_bps_per_side):
     """Where the return actually comes from: overnight vs intraday vs holding."""
     fig = go.Figure()
 
     series = [
-        ('Overnight (close to open)', apply_costs(portfolio['Overnight'], cost_bps_per_side)),
-        ('Intraday (open to close)', portfolio['Intraday']),
-        ('Buy and hold', portfolio['BuyHold']),
+        ('Overnight (close to open)', apply_costs(frame['Overnight'], cost_bps_per_side)),
+        ('Intraday (open to close)', frame['Intraday']),
+        ('Buy and hold', frame['BuyHold']),
     ]
 
-    for i, (label, returns) in enumerate(series):
-        pnl = cumulative_pnl(returns)
+    for i, (name, returns) in enumerate(series):
+        # Floor the curve at $1 so a leg that compounds to nothing stays on a
+        # log axis instead of running off to negative infinity.
+        equity = compounded_equity(returns).clip(lower=1.0)
         fig.add_trace(go.Scatter(
-            x=pnl.index,
-            y=pnl.values,
+            x=equity.index,
+            y=equity.values,
             mode='lines',
-            name=label,
+            name=name,
             line=dict(color=SERIES_COLORS[i], width=2),
             hovertemplate='%{fullData.name}: $%{y:,.0f}<extra></extra>',
         ))
 
     style_layout(
         fig,
-        'Where the return shows up',
-        f'Equal weight basket, cumulative P&amp;L on ${CAPITAL:,.0f} per session',
-        'Cumulative P&L',
-        x_range=(portfolio.index[0], portfolio.index[-1]),
+        f'{label}: where the return shows up',
+        f'Growth of ${CAPITAL:,.0f} by session, log scale',
+        f'Value of ${CAPITAL:,.0f} stake',
+        x_range=(frame.index[0], frame.index[-1]),
+        log=True,
     )
     return fig
 
 
-def cost_sensitivity(portfolio_overnight):
-    """How the basket holds up as costs rise, in bps per side."""
+def cost_sensitivity(frame, label):
+    """How the strategy holds up as costs rise, against buy and hold."""
+    buy_hold = total_return(frame['BuyHold'])
     rows = []
-    for cost in [0.0, 1.0, 2.0, 5.0, 10.0]:
-        net = apply_costs(portfolio_overnight, cost)
-        equity = compounded_equity(net)
-        years = (net.index[-1] - net.index[0]).days / 365.25
+    for cost in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0]:
+        net = apply_costs(frame['Overnight'], cost)
         rows.append({
             'Cost bps/side': cost,
-            'Total P&L': cumulative_pnl(net).iloc[-1],
-            'Compounded Return': equity.iloc[-1] / CAPITAL - 1,
-            'CAGR': (equity.iloc[-1] / CAPITAL) ** (1 / years) - 1 if years > 0 else np.nan,
+            'Overnight Return': total_return(net),
+            'Overnight CAGR': annualized(net),
+            'Beats Buy & Hold': 'yes' if total_return(net) > buy_hold else 'no',
         })
-    return pd.DataFrame(rows)
+    frame_out = pd.DataFrame(rows)
+    print(f"\nCost sensitivity, {label} (buy and hold = {buy_hold:,.1%})")
+    print(frame_out.assign(**{
+        'Overnight Return': frame_out['Overnight Return'].map(lambda v: f"{v:,.1%}"),
+        'Overnight CAGR': frame_out['Overnight CAGR'].map(lambda v: f"{v:.2%}"),
+    }).to_string(index=False))
 
 
 def format_metrics(results_df):
     """Percentages as percentages and dollars as dollars, for printing."""
     out = results_df.copy()
-    for column in ['Compounded Return', 'CAGR', 'Max Drawdown', 'Win Rate',
-                   'Best Night', 'Worst Night', 'Intraday Return', 'Buy & Hold Return']:
+    for column in ['Overnight Return', 'Intraday Return', 'Buy & Hold Return']:
+        out[column] = out[column].map(lambda v: f"{v:,.1%}")
+    for column in ['Overnight CAGR', 'Buy & Hold CAGR', 'Overnight Vol',
+                   'Buy & Hold Vol', 'Max Drawdown', 'Win Rate']:
         out[column] = out[column].map(lambda v: f"{v:.2%}")
-    out['Total P&L'] = out['Total P&L'].map(lambda v: f"${v:,.0f}")
-    for column in ['Sharpe', 'Avg bps/Night', 'Beta vs ' + BENCHMARK]:
+    out['Fixed-Notional P&L'] = out['Fixed-Notional P&L'].map(lambda v: f"${v:,.0f}")
+    for column in ['Sharpe', 'Avg bps/Night', 'Beta vs ' + BENCHMARK, 'Breakeven bps/side']:
         out[column] = out[column].map(lambda v: f"{v:.2f}")
     return out
 
@@ -382,57 +475,47 @@ def main():
         print('No usable price data, nothing to backtest')
         return
 
+    basket = build_basket(returns_by_ticker)
+
     results = [
         compute_metrics(ticker, frame, benchmark_returns, COST_BPS_PER_SIDE)
         for ticker, frame in returns_by_ticker.items()
     ]
-
-    portfolio = build_portfolio(returns_by_ticker)
-    results.append(
-        compute_metrics('BASKET (EW)', portfolio, benchmark_returns, COST_BPS_PER_SIDE)
-    )
-
+    results.append(compute_metrics('BASKET (EW)', basket, benchmark_returns, COST_BPS_PER_SIDE))
     results_df = pd.DataFrame(results)
 
     print('\nBuy at the close, sell at the next open')
-    print(f"Window: {START_DATE} to {END_DATE or 'latest'} | "
-          f"${CAPITAL:,.0f} per name per night | "
-          f"costs: {COST_BPS_PER_SIDE:g} bps per side\n")
+    print(f"Window: {START_DATE or 'full history'} to {END_DATE or 'latest'} | "
+          f"${CAPITAL:,.0f} stake | costs: {COST_BPS_PER_SIDE:g} bps per side")
+    print('Returns are compounded; "Breakeven bps/side" is the cost at which '
+          'overnight stops beating buy and hold.\n')
     print(format_metrics(results_df).to_string(index=False))
 
-    print('\nCost sensitivity, equal weight basket')
-    sensitivity = cost_sensitivity(portfolio['Overnight'])
-    print(sensitivity.assign(
-        **{
-            'Total P&L': sensitivity['Total P&L'].map(lambda v: f"${v:,.0f}"),
-            'Compounded Return': sensitivity['Compounded Return'].map(lambda v: f"{v:.2%}"),
-            'CAGR': sensitivity['CAGR'].map(lambda v: f"{v:.2%}"),
-        }
-    ).to_string(index=False))
+    cost_sensitivity(basket, 'equal weight basket')
+    if FOCUS_TICKER in returns_by_ticker:
+        cost_sensitivity(returns_by_ticker[FOCUS_TICKER], FOCUS_TICKER)
 
-    pnl_by_ticker = {
-        ticker: cumulative_pnl(apply_costs(frame['Overnight'], COST_BPS_PER_SIDE))
-        for ticker, frame in returns_by_ticker.items()
-    }
-    portfolio_pnl = cumulative_pnl(apply_costs(portfolio['Overnight'], COST_BPS_PER_SIDE))
-
-    pnl_fig = create_pnl_chart(pnl_by_ticker, portfolio_pnl, COST_BPS_PER_SIDE)
-    session_fig = create_session_chart(portfolio, COST_BPS_PER_SIDE)
+    growth_fig = create_growth_chart(returns_by_ticker, basket, COST_BPS_PER_SIDE)
+    pnl_fig = create_pnl_chart(returns_by_ticker, basket, COST_BPS_PER_SIDE)
+    focus_frame = returns_by_ticker.get(FOCUS_TICKER, basket)
+    focus_label = FOCUS_TICKER if FOCUS_TICKER in returns_by_ticker else 'Equal weight basket'
+    session_fig = create_session_chart(focus_frame, focus_label, COST_BPS_PER_SIDE)
 
     os.makedirs(CHART_DIR, exist_ok=True)
-    pnl_path = os.path.join(CHART_DIR, 'overnight_pnl.html')
-    session_path = os.path.join(CHART_DIR, 'overnight_vs_intraday.html')
+    outputs = [
+        ('overnight_growth.html', growth_fig),
+        ('overnight_pnl.html', pnl_fig),
+        ('overnight_vs_intraday.html', session_fig),
+    ]
+    for filename, figure in outputs:
+        figure.write_html(os.path.join(CHART_DIR, filename))
+        print(f"Saved {os.path.join(CHART_DIR, filename)}")
+
     metrics_path = os.path.join(CHART_DIR, 'overnight_metrics.csv')
-
-    pnl_fig.write_html(pnl_path)
-    session_fig.write_html(session_path)
     results_df.to_csv(metrics_path, index=False)
-
-    print(f"\nSaved {pnl_path}")
-    print(f"Saved {session_path}")
     print(f"Saved {metrics_path}")
 
-    show_figures(pnl_fig, session_fig)
+    show_figures(growth_fig, pnl_fig, session_fig)
 
 
 if __name__ == '__main__':
