@@ -20,7 +20,6 @@ there to say whether the year is continuing something or breaking from it.
 import os
 import sys
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -30,7 +29,6 @@ from overnight_close_to_open import (  # noqa: E402
     BENCHMARK,
     CHART_DIR,
     COST_BPS_PER_SIDE,
-    INK_MUTED,
     SERIES_COLORS,
     TICKERS as SEMI_TICKERS,
     add_end_label,

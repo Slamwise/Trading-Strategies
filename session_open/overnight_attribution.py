@@ -149,7 +149,7 @@ def main():
         )
 
     trailing = trailing_table(baskets, YEAR, WINDOWS)
-    print(f"\nOvernight leg, trailing windows")
+    print("\nOvernight leg, trailing windows")
     print(show(trailing,
                percent_columns=[c for c in trailing.columns if c.endswith('cum')],
                bps_columns=[c for c in trailing.columns if c.endswith('bps')]))
